@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch import tensor
+from torch import tensor, Tensor
 from torch.nn import Module
 
 from improving_transformers_world_model.tensor_typing import (
@@ -37,7 +37,7 @@ class Env(Module):
 
     def forward(
         self,
-        actions: Int['a'],
+        actions: Tensor,
     ) -> tuple[
         FrameState,
         Scalar,

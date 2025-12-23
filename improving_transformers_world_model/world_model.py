@@ -545,6 +545,7 @@ class WorldModel(Module):
         patch_size,
         channels,
         num_actions = 0,            # if set to 0, disabled
+        action_dim = 0,             # continuous actions, if set to 0, disabled
         reward_min_value = 0.,
         reward_max_value = 1.,
         reward_num_bins = 0.,       # if set to 0, disabled
@@ -604,13 +605,19 @@ class WorldModel(Module):
         # action conditioning related
 
         self.num_actions = num_actions
+        self.action_dim = action_dim
 
-        can_cond_on_actions = num_actions > 0
+        use_discrete_actions = num_actions > 0
+        use_continuous_actions = action_dim > 0
+        assert not (use_discrete_actions and use_continuous_actions), 'choose either discrete actions or continuous actions'
+
+        can_cond_on_actions = use_discrete_actions or use_continuous_actions
         self.can_cond_on_actions = can_cond_on_actions
 
         self.action_embed_sos = nn.Parameter(torch.zeros(model_dim))
 
-        self.action_embed = nn.Embedding(num_actions, model_dim) if can_cond_on_actions else None
+        self.action_embed = nn.Embedding(num_actions, model_dim) if use_discrete_actions else None
+        self.action_proj = nn.Linear(action_dim, model_dim) if use_continuous_actions else None
 
         # reward related
 
@@ -764,7 +771,7 @@ class WorldModel(Module):
         self,
         state_or_token_ids: Float['b c t h w'] | Int['b t h w'],
         rewards: Float['b t'] | None = None,
-        actions: Int['b t a'] | None = None, # values of < 0 as padding, allowing for multiple actions to be summed per timestep
+        actions: Int['b t a'] | Float['b t a'] | None = None, # values of < 0 as padding for discrete actions
         is_terminal: Bool['b t'] | None = None, # learn to predict the terminal state, for the agent interacting with the world model in MDP manner
         cache = None,
         remove_cache_len_from_time = True,
@@ -778,7 +785,8 @@ class WorldModel(Module):
         batch = state_or_token_ids.shape[0]
 
         assert xnor(exists(rewards), self.can_pred_reward)
-        assert xnor(exists(actions), self.can_cond_on_actions)
+        if exists(actions):
+            assert self.can_cond_on_actions
 
         if state_or_token_ids.dtype  == torch.float:
             state = state_or_token_ids
@@ -824,14 +832,17 @@ class WorldModel(Module):
         # maybe action conditioning
 
         if exists(actions):
-            no_actions = actions < 0
-            actions = actions.masked_fill(no_actions, 0)
-            action_embeds = self.action_embed(actions)
+            if exists(self.action_embed):
+                no_actions = actions < 0
+                actions = actions.masked_fill(no_actions, 0)
+                action_embeds = self.action_embed(actions)
 
-            if not is_empty(action_embeds):
-                action_embeds = einx.where('b t n, b t n d, -> b t n d', ~no_actions, action_embeds, 0.)
+                if not is_empty(action_embeds):
+                    action_embeds = einx.where('b t n, b t n d, -> b t n d', ~no_actions, action_embeds, 0.)
 
-            action_embeds = reduce(action_embeds, 'b t n d -> b t d', 'sum')
+                action_embeds = reduce(action_embeds, 'b t n d -> b t d', 'sum')
+            else:
+                action_embeds = self.action_proj(actions)
 
             action_embed_sos = repeat(self.action_embed_sos, 'd -> b 1 d', b = batch)
             action_embeds = cat((action_embed_sos, action_embeds[:, :-1]), dim = 1)
