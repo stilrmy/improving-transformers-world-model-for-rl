@@ -293,13 +293,52 @@ class Actor(Module):
         dim_input,
         dim,
         *,
-        num_actions,
+        num_actions: int | None = None,
+        action_dim: int | None = None,
+        action_range: float | tuple[float, float] = 1.,
         dim_world_model_embed = None,
         num_layers = 3,
         expansion_factor = 2.,
     ):
         super().__init__()
         self.num_actions = num_actions
+        self.action_dim = default(action_dim, 0)
+        self.register_buffer('action_scale', None)
+        self.register_buffer('action_offset', None)
+
+        use_discrete = exists(num_actions)
+        use_continuous = self.action_dim > 0
+        assert use_discrete ^ use_continuous, 'set either `num_actions` (discrete) or `action_dim` (continuous)'
+
+        self.is_continuous = use_continuous
+
+        if self.is_continuous:
+            if isinstance(action_range, (int, float)):
+                action_scale = torch.full((self.action_dim,), float(action_range))
+                action_offset = torch.zeros(self.action_dim)
+            else:
+                assert len(action_range) == 2, 'action_range tuple must be (low, high)'
+                low, high = action_range
+                low_tensor = torch.as_tensor(low, dtype = torch.float32)
+                high_tensor = torch.as_tensor(high, dtype = torch.float32)
+
+                if low_tensor.ndim == 0:
+                    low_tensor = low_tensor.expand(self.action_dim)
+                if high_tensor.ndim == 0:
+                    high_tensor = high_tensor.expand(self.action_dim)
+
+                assert low_tensor.shape == (self.action_dim,), 'action_range lows must broadcast to action_dim'
+                assert high_tensor.shape == (self.action_dim,), 'action_range highs must broadcast to action_dim'
+
+                span = high_tensor - low_tensor
+                assert torch.all(span > 0), 'action_range highs must be greater than lows'
+
+                action_scale = span / 2
+                action_offset = (high_tensor + low_tensor) / 2
+
+            assert torch.all(action_scale > 0), 'action_range scale must be positive'
+            self.action_scale = action_scale
+            self.action_offset = action_offset
 
         dim_hidden = int(expansion_factor * dim)
 
@@ -318,7 +357,11 @@ class Actor(Module):
 
         self.layers = ModuleList(layers)
 
-        self.to_actions_pred = nn.Linear(dim, num_actions)
+        action_out_dim = num_actions if use_discrete else self.action_dim
+        self.to_actions_pred = nn.Linear(dim, action_out_dim)
+
+        if self.is_continuous:
+            self.log_std = nn.Parameter(torch.zeros(self.action_dim))
 
         # able to condition on world model embed when predicting action - using classic film
 
@@ -327,16 +370,7 @@ class Actor(Module):
         if self.can_cond_on_world_model:
             self.world_model_film = FiLM(dim_world_model_embed, dim)
 
-    def forward(
-        self,
-        state: Float['b c h w'],
-        world_model_embed: Float['b d'] | None = None,
-        sample_action = False
-    ) -> (
-        Float['b'] |
-        tuple[Int['b'], Float['b']]
-    ):
-
+    def get_dist(self, state, world_model_embed = None):
         embed = self.proj_in(state)
 
         if exists(world_model_embed):
@@ -347,14 +381,35 @@ class Actor(Module):
         for layer in self.layers:
             embed = layer(embed) + embed
 
-        action_logits = self.to_actions_pred(embed)
+        action_params = self.to_actions_pred(embed)
+
+        if self.is_continuous:
+            log_std = self.log_std.clamp(-20, 2)
+            std = log_std.exp() * self.action_scale
+            mean = action_params * self.action_scale + self.action_offset
+            return torch.distributions.Normal(mean, std)
+
+        return torch.distributions.Categorical(logits = action_params)
+
+    def forward(
+        self,
+        state: Float['b c h w'],
+        world_model_embed: Float['b d'] | None = None,
+        sample_action = False
+    ) -> (
+        Float['b'] |
+        tuple[Tensor, Float['b']]
+    ):
+        dist = self.get_dist(state, world_model_embed = world_model_embed)
 
         if not sample_action:
-            return action_logits
+            return dist.logits if not self.is_continuous else dist.mean
 
-        actions = gumbel_sample(action_logits, dim = -1)
+        actions = dist.rsample() if self.is_continuous else dist.sample()
+        log_probs = dist.log_prob(actions)
 
-        log_probs = get_log_prob(action_logits, actions)
+        if self.is_continuous:
+            log_probs = log_probs.sum(dim = -1)
 
         return (actions, log_probs)
 
@@ -419,7 +474,7 @@ Loss = Scalar
 
 class Memory(NamedTuple):
     state:           FrameState
-    action:          Int['a']
+    action:          Tensor
     action_log_prob: Scalar
     reward:          Scalar
     value:           Scalar
@@ -453,7 +508,8 @@ class Agent(Module):
         critic_optim_kwargs: dict = dict(),
         critic_ema_kwargs: dict = dict(),
         max_memories = 128_000,
-        standardize_target_momentum = 0.95
+        standardize_target_momentum = 0.95,
+        action_range: float = 1.
     ):
         super().__init__()
 
@@ -464,6 +520,7 @@ class Agent(Module):
 
         if isinstance(actor, dict):
             actor.update(dim_input = dim_state)
+            actor.setdefault('action_range', action_range)
             actor = Actor(**actor)
 
         if isinstance(critic, dict):
@@ -473,6 +530,10 @@ class Agent(Module):
         self.impala = impala
         self.actor = actor
         self.critic = critic
+
+        self.is_continuous_action_space = actor.is_continuous
+        self.action_size = actor.action_dim if self.is_continuous_action_space else 1
+        self.action_dtype = torch.float32 if self.is_continuous_action_space else torch.long
 
         self.critic_ema = EMA(critic, **critic_ema_kwargs)
 
@@ -507,7 +568,7 @@ class Agent(Module):
     def policy_loss(
         self,
         states: Float['b c h w'],
-        actions: Int['b'],
+        actions: Tensor,
         old_log_probs: Float['b'],
         values: Float['b'],
         returns: Float['b'],
@@ -520,11 +581,17 @@ class Agent(Module):
         advantages = F.layer_norm(returns - values, (batch,))
 
         actor_critic_input, _ = self.impala(states)
-        action_logits = self.actor(actor_critic_input, world_model_embed = world_model_embeds)
+        dist = self.actor.get_dist(actor_critic_input, world_model_embed = world_model_embeds)
 
-        prob = action_logits.softmax(dim = -1)
+        log_probs = dist.log_prob(actions)
 
-        log_probs = get_log_prob(action_logits, actions)
+        if self.actor.is_continuous:
+            log_probs = log_probs.sum(dim = -1)
+
+        action_entropy = dist.entropy()
+
+        if self.actor.is_continuous:
+            action_entropy = action_entropy.sum(dim = -1)
 
         ratios = (log_probs - old_log_probs).exp()
 
@@ -535,7 +602,6 @@ class Agent(Module):
         surr1 = ratios * advantages
         surr2 = ratios.clamp(1. - clip, 1. + clip) * advantages
 
-        action_entropy = calc_entropy(prob) # encourage exploration
         policy_loss = torch.min(surr1, surr2) - self.actor_beta_s * action_entropy
 
         return policy_loss
@@ -701,7 +767,7 @@ class Agent(Module):
         # prepare for looping with world model
         # gathering up all the memories of states, actions, rewards for training
 
-        actions = torch.empty((1, 0, 1), device = device, dtype = torch.long)
+        actions = torch.empty((1, 0, self.action_size), device = device, dtype = self.action_dtype)
         action_log_probs = torch.empty((1, 0), device = device, dtype = torch.float32)
 
         states = rearrange(next_state, 'c h w -> 1 c 1 h w')
@@ -751,7 +817,10 @@ class Agent(Module):
 
             next_state, next_reward, next_done = to_device_decorator(env)(action)
 
-            action = rearrange(action, '1 -> 1 1 1')
+            if not self.is_continuous_action_space:
+                action = rearrange(action, 'b -> b 1 1')
+            else:
+                action = rearrange(action, 'b d -> b 1 d')
             action_log_prob = rearrange(action_log_prob, '1 -> 1 1')
 
             actions = cat((actions, action), dim = 1)
@@ -793,7 +862,7 @@ class Agent(Module):
 
         episode_memories = tuple(Memory(*timestep_tensors) for timestep_tensors in zip(
             rearrange(states, 'c t h w -> t c h w'),
-            rearrange(actions, '... 1 -> ...'), # fix for multi-actions later
+            actions,
             action_log_probs,
             rewards,
             values,
@@ -818,7 +887,11 @@ class Agent(Module):
 
         device = init_state.device
 
-        assert world_model.num_actions == self.actor.num_actions
+        if world_model.can_cond_on_actions:
+            if self.actor.is_continuous:
+                assert world_model.action_dim == self.actor.action_dim, 'world model action_dim must match actor'
+            else:
+                assert world_model.num_actions == self.actor.num_actions, 'world model num_actions must match actor'
 
         memories = default(memories, deque([], maxlen = self.max_memories))
 
@@ -827,7 +900,7 @@ class Agent(Module):
         # prepare for looping with world model
         # gathering up all the memories of states, actions, rewards for training
 
-        actions = torch.empty((1, 0, 1), device = device, dtype = torch.long)
+        actions = torch.empty((1, 0, self.action_size), device = device, dtype = self.action_dtype)
         action_log_probs = torch.empty((1, 0), device = device, dtype = torch.float32)
 
         states = rearrange(next_state, '1 c h w -> 1 c 1 h w')
@@ -868,7 +941,10 @@ class Agent(Module):
 
             action, action_log_prob = self.actor(actor_critic_input, world_model_embed = world_model_embed, sample_action = True)
 
-            action = rearrange(action, 'b -> b 1 1')
+            if not self.is_continuous_action_space:
+                action = rearrange(action, 'b -> b 1 1')
+            else:
+                action = rearrange(action, 'b d -> b 1 d')
             action_log_prob = rearrange(action_log_prob, 'b -> b 1')
 
             actions = cat((actions, action), dim = 1)
@@ -911,7 +987,7 @@ class Agent(Module):
 
         episode_memories = tuple(Memory(*timestep_tensors) for timestep_tensors in zip(
             rearrange(states, 'c t h w -> t c h w'),
-            rearrange(actions, '... 1 -> ...'), # fix for multi-actions later
+            actions,
             action_log_probs,
             rewards,
             values,
